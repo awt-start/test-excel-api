@@ -32,7 +32,7 @@ async def render_notice(request: RenderRequest):
         raise HTTPException(status_code=404, detail=f"模板文件 '{template_path}' 不存在。")
 
     # Pydantic模型转字典，并处理别名
-    context = request.data.model_dump(by_alias=True)
+    context =  request.data.model_dump() 
 
     try:
         # 渲染Excel
@@ -46,7 +46,7 @@ async def render_notice(request: RenderRequest):
             return FileResponse(
                 path=tmp.name,
                 media_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-                filename=f"{request.template_type}_通知单_{context['编号']}.xlsx"
+                filename=f"{request.template_type}_通知单_{context['notice_no']}.xlsx"
             )
     except Exception as e:
         # 清理临时文件（如果存在）

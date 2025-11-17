@@ -3,99 +3,143 @@ import os
 import re
 import openpyxl
 from jinja2 import Environment, BaseLoader, TemplateSyntaxError
-from openpyxl.utils import get_column_letter
 
-# 正则表达式，用于匹配Jinja2的for循环块
-FOR_LOOP_PATTERN = re.compile(r"{%\s*for\s+(\w+)\s+in\s+(\w+)\s*%}(.*){%\s*endfor\s*%}", re.DOTALL)
+# 正则表达式，用于匹配Jinja2的for循环的开始和结束
+FOR_START_PATTERN = re.compile(r"{%\s*for\s+(\w+)\s+in\s+(\w+)\s*%}")
+FOR_END_PATTERN = re.compile(r"{%\s*endfor\s*%}")
+
+def _copy_style(source_cell, target_cell):
+    """
+    使用 openpyxl 内部机制，稳健地复制单元格样式。
+    这是解决 'StyleArray' 问题的关键。
+    """
+    if source_cell.has_style:
+        # 将源单元格的样式对象赋值给目标单元格
+        # openpyxl 会自动处理样式的深拷贝
+        target_cell._style = source_cell._style
 
 def render_excel_template(template_path: str, context: dict) -> openpyxl.Workbook:
     """
-    渲染一个包含Jinja2语法的Excel模板。
-
-    :param template_path: Excel模板文件路径。
-    :param context: 用于渲染的上下文字典。
-    :return: 渲染后的 openpyxl.Workbook 对象。
+    渲染一个包含Jinja2语法的Excel模板，支持多行循环并保留样式。
     """
     wb = openpyxl.load_workbook(template_path)
     ws = wb.active
     
     env = Environment(loader=BaseLoader())
     
-    # --- 处理多行循环 ---
-    # 我们需要先找到并处理循环行，因为它们会改变行数
-    rows_to_process = []
-    for row_idx, row in enumerate(ws.iter_rows(), 1):
-        # 检查该行是否包含for循环
-        # 我们将整行内容拼接成一个字符串来检查
-        row_content = "".join([cell.value or "" for cell in row])
-        if "{% for" in row_content and "{% endfor %}" in row_content:
-            rows_to_process.append(row_idx)
+    # --- 第一步：扫描并定位所有循环块 ---
+    loop_blocks = []
+    max_row = ws.max_row
+    max_col = ws.max_column
 
-    # 从后往前处理，避免插入行时影响后续的行索引
-    for row_idx in reversed(rows_to_process):
-        # 找到for循环的开始和结束标记所在的列
-        start_col, end_col = None, None
-        loop_var, list_name, loop_content = None, None, None
+    for row_idx in range(max_row, 0, -1):
+        for col_idx in range(max_col, 0, -1):
+            cell = ws.cell(row=row_idx, column=col_idx)
+            if not cell.value or not isinstance(cell.value, str):
+                continue
 
-        for col_idx, cell in enumerate(ws[row_idx], 1):
-            if cell.value and isinstance(cell.value, str):
-                if "{% for" in cell.value:
-                    start_col = col_idx
-                if "{% endfor %}" in cell.value:
-                    end_col = col_idx
-        
-        if not start_col or not end_col:
-            continue # 跳过格式不正确的行
+            if FOR_END_PATTERN.search(cell.value):
+                end_row, end_col = row_idx, col_idx
+                start_row, start_col = None, None
+                loop_var, list_name = None, None
 
-        # 提取循环内容
-        loop_cell_value = ws.cell(row=row_idx, column=start_col).value
-        match = FOR_LOOP_PATTERN.match(loop_cell_value)
-        if not match:
+                for r_idx in range(end_row, 0, -1):
+                    for c_idx in range(max_col, 0, -1):
+                        if r_idx == end_row and c_idx >= end_col:
+                            continue
+                        
+                        start_cell = ws.cell(row=r_idx, column=c_idx)
+                        if not start_cell.value or not isinstance(start_cell.value, str):
+                            continue
+                        
+                        match = FOR_START_PATTERN.search(start_cell.value)
+                        if match:
+                            start_row, start_col = r_idx, c_idx
+                            loop_var, list_name = match.groups()
+                            break
+                    if start_row:
+                        break
+                
+                if start_row:
+                    loop_blocks.append({
+                        "start_row": start_row,
+                        "end_row": end_row,
+                        "start_col": start_col,
+                        "end_col": end_col,
+                        "loop_var": loop_var,
+                        "list_name": list_name
+                    })
+
+    # --- 第二步：处理找到的循环块 ---
+    for block in loop_blocks:
+        start_row = block["start_row"]
+        end_row = block["end_row"]
+        start_col = block["start_col"]
+        end_col = block["end_col"]
+        loop_var = block["loop_var"]
+        list_name = block["list_name"]
+
+        project_list = context.get(list_name)
+        if not project_list:
+            ws.delete_rows(start_row, (end_row - start_row + 1))
             continue
-            
-        loop_var, list_name, loop_content = match.groups()
-        project_list = context.get(list_name, [])
 
-        # 删除原始模板行
-        ws.delete_rows(row_idx)
+        # 提取模板区域内的所有单元格值和样式
+        template_rows_data = []
+        for r_idx in range(start_row, end_row + 1):
+            row_data = []
+            for c_idx in range(start_col, end_col + 1):
+                cell = ws.cell(row=r_idx, column=c_idx)
+                # 存储单元格对象本身，以便后续复制样式
+                row_data.append(cell)
+            template_rows_data.append(row_data)
+        
+        ws.delete_rows(start_row, (end_row - start_row + 1))
 
-        # 为列表中的每个项目创建一行
-        for i, project_item in enumerate(project_list):
-            # 插入新行
-            ws.insert_rows(row_idx + i)
+        # --- 第三步：为每个项目创建新行并渲染 ---
+        for i, project_item in enumerate(reversed(project_list)):
+            ws.insert_rows(start_row, len(template_rows_data))
             
-            # 创建一个临时的上下文，将循环变量（如'project'）指向当前项目
             temp_context = {loop_var: project_item}
             
-            # 渲染这一行的每个单元格
-            for col_idx in range(start_col, end_col + 1):
-                original_cell_value = ws.cell(row=row_idx + i, column=col_idx).value
-                if isinstance(original_cell_value, str) and "{{" in original_cell_value:
-                    # 清理掉for/endfor标签，只保留内容
-                    clean_value = original_cell_value.replace(f"{{% for {loop_var} in {list_name} %}}", "").replace("{% endfor %}", "").strip()
-                    template = env.from_string(clean_value)
-                    rendered_value = template.render(temp_context)
-                    ws.cell(row=row_idx + i, column=col_idx, value=rendered_value)
-                # 如果单元格内容只是for/endfor，则清空
-                elif original_cell_value and ("{% for" in original_cell_value or "{% endfor %}" in original_cell_value):
-                     ws.cell(row=row_idx + i, column=col_idx, value=None)
+            for r_offset, template_cells in enumerate(template_rows_data):
+                for c_offset, template_cell in enumerate(template_cells):
+                    current_cell = ws.cell(row=start_row + r_offset, column=start_col + c_offset)
+                    original_value = template_cell.value
 
+                    # *** 修正点：直接复制整个样式对象 ***
+                    if template_cell.has_style:
+                        _copy_style(template_cell, current_cell)
 
-    # --- 处理普通变量 ---
-    # 再次遍历所有单元格，处理简单的变量替换
+                    # 渲染值
+                    if isinstance(original_value, str) and "{{" in original_value:
+                        clean_value = FOR_START_PATTERN.sub("", original_value).strip()
+                        clean_value = FOR_END_PATTERN.sub("", clean_value).strip()
+                        
+                        if clean_value:
+                            try:
+                                template = env.from_string(clean_value)
+                                rendered_value = template.render(temp_context)
+                                current_cell.value = rendered_value
+                            except TemplateSyntaxError:
+                                current_cell.value = original_value
+                        else:
+                            current_cell.value = None
+                    else:
+                        if isinstance(original_value, str) and ("{% for" in original_value or "{% endfor %}" in original_value):
+                            current_cell.value = None
+                        else:
+                            current_cell.value = original_value
+
+    # --- 第四步：处理页面中剩余的普通变量 ---
     for row in ws.iter_rows():
         for cell in row:
-            if cell.value and isinstance(cell.value, str):
-                # 跳过已经被循环处理过的复杂内容
-                if "{%" in cell.value:
-                    continue
-                if "{{" in cell.value:
-                    try:
-                        template = env.from_string(cell.value)
-                        rendered_value = template.render(context)
-                        cell.value = rendered_value
-                    except TemplateSyntaxError:
-                        # 忽略语法错误，可能是未闭合的标签
-                        pass
+            if cell.value and isinstance(cell.value, str) and "{{" in cell.value and "{%" not in cell.value:
+                try:
+                    template = env.from_string(cell.value)
+                    rendered_value = template.render(context)
+                    cell.value = rendered_value
+                except TemplateSyntaxError:
+                    pass
                         
     return wb
