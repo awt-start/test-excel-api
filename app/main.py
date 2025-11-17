@@ -14,6 +14,7 @@ logger.setLevel(logging.INFO)
 
 app.include_router(notice.router, prefix="/api/v1/notices", tags=["通知单"])
 
+
 @app.get("/")
 def read_root():
     return {"message": "欢迎使用Excel渲染API，请访问 /docs 查看文档。"}
