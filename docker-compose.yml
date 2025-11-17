@@ -1,0 +1,58 @@
+version: '3.8'
+
+services:
+  # Excel渲染API服务
+  excel-fund-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: excel-fund-api
+    ports:
+      - "8000:8000"
+    environment:
+      - ENVIRONMENT=production
+      - LOG_LEVEL=INFO
+    volumes:
+      # 挂载模板文件夹（如果需要在容器外修改模板）
+      - ./templates:/app/templates:ro
+      # 挂载日志目录
+      - ./logs:/app/logs
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    networks:
+      - excel-fund-network
+
+  # 开发环境服务（可选）
+  excel-fund-dev:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: excel-fund-dev
+    ports:
+      - "8001:8000"
+    environment:
+      - ENVIRONMENT=development
+      - LOG_LEVEL=DEBUG
+    volumes:
+      # 开发时挂载源代码，支持热重载
+      - .:/app
+      - /app/__pycache__
+    command: ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
+    profiles:
+      - dev
+    networks:
+      - excel-fund-network
+
+networks:
+  excel-fund-network:
+    driver: bridge
+    name: excel-fund-network
+
+volumes:
+  excel-fund-logs:
+    driver: local
